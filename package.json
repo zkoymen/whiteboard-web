@@ -1,0 +1,33 @@
+{
+  "name": "whiteboard-web",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "concurrently -n web,realtime -c cyan,green \"npm run dev --workspace @whiteboard/web\" \"npm run dev --workspace @whiteboard/realtime\"",
+    "dev:web": "npm run dev --workspace @whiteboard/web",
+    "dev:realtime": "npm run dev --workspace @whiteboard/realtime",
+    "build": "npm run build --workspace @whiteboard/shared && npm run build --workspace @whiteboard/db && npm run build --workspace @whiteboard/auth && npm run build --workspace @whiteboard/realtime && npm run build --workspace @whiteboard/web",
+    "typecheck": "npm run typecheck --workspace @whiteboard/shared && npm run typecheck --workspace @whiteboard/db && npm run typecheck --workspace @whiteboard/auth && npm run typecheck --workspace @whiteboard/realtime && npm run typecheck --workspace @whiteboard/web",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:e2e": "playwright test",
+    "db:generate": "drizzle-kit generate",
+    "db:push": "drizzle-kit push"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.58.2",
+    "@types/node": "^25.5.0",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@types/ws": "^8.18.1",
+    "concurrently": "^9.2.1",
+    "drizzle-kit": "^0.31.10",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.0"
+  }
+}
