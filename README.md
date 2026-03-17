@@ -1,6 +1,9 @@
 # Collaborative Whiteboard MVP
 
-A minimal multi-user whiteboard app focused on real-time collaboration, simple sharing, and fast local development.
+While I was teaching my friend English online using Google Meet and other platforms, I've noticed that extensions are poorly managed and feel so insufficient. So, I have decided to come-up with this MVP of collaborative whiteboard.
+The main drawing functionalities were taken from tldraw library, no need to reinvent the wheel. And authorization anc access management is arranged with the help of cookies. Initially, PostgreSQL was used, but the fallback db errors was too much to handle. In the future, Supabase may be integrated.
+
+Deployment options are being considered for now...
 
 ## Features
 
@@ -50,4 +53,3 @@ npm run build
 ## Notes
 
 - Current MVP persistence is file-based for simple local debugging.
-- Production-grade database/auth hardening is planned for later iterations.
