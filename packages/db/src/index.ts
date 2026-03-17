@@ -1,209 +1,335 @@
-import { mkdir } from "node:fs/promises";
-import { createHash, randomUUID } from "node:crypto";
-import { join } from "node:path";
-import { PGlite } from "@electric-sql/pglite";
-import { and, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
-import { drizzle as drizzlePglite } from "drizzle-orm/pglite";
-import { drizzle as drizzlePostgres } from "drizzle-orm/postgres-js";
-import postgres from "postgres";
+import { createHash, randomBytes, randomUUID, scryptSync, timingSafeEqual } from "node:crypto";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { dirname, resolve } from "node:path";
 import { buildBoardAccessContext, type BoardAccessContext, type BoardMemberSummary, type BoardRole, type BoardSummary, type ShareLinkMode, type ShareLinkSummary } from "@whiteboard/shared";
-import { boardMembers, boards, schema, shareLinks, user } from "./schema";
 
-type Database = any;
+type StoredUser = {
+  id: string;
+  name: string;
+  email: string;
+  passwordHash: string;
+  emailVerified: boolean;
+  image: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
 
-declare global {
-  // eslint-disable-next-line no-var
-  var __whiteboardDb: Promise<Database> | undefined;
+type StoredSession = {
+  id: string;
+  token: string;
+  userId: string;
+  expiresAt: string;
+  createdAt: string;
+  updatedAt: string;
+  ipAddress: string | null;
+  userAgent: string | null;
+};
+
+type StoredBoard = {
+  id: string;
+  name: string;
+  ownerId: string;
+  createdAt: string;
+  updatedAt: string;
+  latestSnapshot: unknown;
+};
+
+type StoredBoardMember = {
+  boardId: string;
+  userId: string;
+  role: "editor" | "viewer";
+  createdAt: string;
+  updatedAt: string;
+};
+
+type StoredShareLink = {
+  id: string;
+  boardId: string;
+  tokenHash: string;
+  mode: ShareLinkMode;
+  createdByUserId: string;
+  revokedAt: string | null;
+  createdAt: string;
+};
+
+type AppState = {
+  users: StoredUser[];
+  sessions: StoredSession[];
+  boards: StoredBoard[];
+  boardMembers: StoredBoardMember[];
+  shareLinks: StoredShareLink[];
+};
+
+const EMPTY_STATE: AppState = {
+  users: [],
+  sessions: [],
+  boards: [],
+  boardMembers: [],
+  shareLinks: [],
+};
+
+const STATE_FILE = resolve(process.env.INIT_CWD ?? process.cwd(), "data", "app-state.json");
+
+let writeQueue = Promise.resolve();
+
+function cloneState(state: AppState): AppState {
+  return JSON.parse(JSON.stringify(state)) as AppState;
 }
 
-async function createDatabase() {
-  const databaseUrl = process.env.DATABASE_URL;
-  if (databaseUrl && databaseUrl.startsWith("postgres://")) {
-    const client = postgres(databaseUrl, { prepare: false });
-    return drizzlePostgres(client, { schema });
-  }
-
-  const location = join(process.cwd(), "data", "local-db");
-  await mkdir(location, { recursive: true });
-  const client = new PGlite(location);
-  return drizzlePglite(client, { schema });
-}
-
-export async function getDb() {
-  globalThis.__whiteboardDb ??= createDatabase();
-  return globalThis.__whiteboardDb;
-}
-
-export async function ensureDatabase() {
-  const db = await getDb();
-  const statements = [
-    `create table if not exists "user" (
-      "id" text primary key,
-      "name" text not null,
-      "email" text not null unique,
-      "email_verified" boolean not null default false,
-      "image" text,
-      "created_at" timestamptz not null,
-      "updated_at" timestamptz not null
-    )`,
-    `create table if not exists "session" (
-      "id" text primary key,
-      "expires_at" timestamptz not null,
-      "token" text not null unique,
-      "created_at" timestamptz not null,
-      "updated_at" timestamptz not null,
-      "ip_address" text,
-      "user_agent" text,
-      "user_id" text not null references "user"("id") on delete cascade
-    )`,
-    `create table if not exists "account" (
-      "id" text primary key,
-      "account_id" text not null,
-      "provider_id" text not null,
-      "user_id" text not null references "user"("id") on delete cascade,
-      "access_token" text,
-      "refresh_token" text,
-      "id_token" text,
-      "access_token_expires_at" timestamptz,
-      "refresh_token_expires_at" timestamptz,
-      "scope" text,
-      "password" text,
-      "created_at" timestamptz not null,
-      "updated_at" timestamptz not null
-    )`,
-    `create table if not exists "verification" (
-      "id" text primary key,
-      "identifier" text not null,
-      "value" text not null,
-      "expires_at" timestamptz not null,
-      "created_at" timestamptz,
-      "updated_at" timestamptz
-    )`,
-    `create table if not exists "boards" (
-      "id" text primary key,
-      "name" text not null,
-      "owner_id" text not null references "user"("id") on delete cascade,
-      "created_at" timestamptz not null,
-      "updated_at" timestamptz not null,
-      "latest_snapshot" jsonb
-    )`,
-    `create table if not exists "board_members" (
-      "board_id" text not null references "boards"("id") on delete cascade,
-      "user_id" text not null references "user"("id") on delete cascade,
-      "role" text not null,
-      "created_at" timestamptz not null,
-      "updated_at" timestamptz not null,
-      primary key ("board_id", "user_id")
-    )`,
-    `create table if not exists "share_links" (
-      "id" text primary key,
-      "board_id" text not null references "boards"("id") on delete cascade,
-      "token_hash" text not null unique,
-      "mode" text not null,
-      "created_by_user_id" text not null references "user"("id") on delete cascade,
-      "revoked_at" timestamptz,
-      "created_at" timestamptz not null
-    )`,
-  ];
-
-  for (const statement of statements) {
-    await db.execute(sql.raw(statement));
-  }
+function toDate(value: string) {
+  return new Date(value);
 }
 
 function hashShareToken(token: string) {
   return createHash("sha256").update(token).digest("hex");
 }
 
+function hashPassword(password: string) {
+  const salt = randomBytes(16).toString("hex");
+  const hash = scryptSync(password, salt, 64).toString("hex");
+  return `${salt}:${hash}`;
+}
+
+function verifyPassword(password: string, passwordHash: string) {
+  const [salt, storedHash] = passwordHash.split(":");
+  const derived = scryptSync(password, salt, 64);
+  const stored = Buffer.from(storedHash, "hex");
+  return timingSafeEqual(derived, stored);
+}
+
+function publicUser(user: StoredUser) {
+  return {
+    id: user.id,
+    name: user.name,
+    email: user.email,
+    emailVerified: user.emailVerified,
+    image: user.image,
+    createdAt: new Date(user.createdAt),
+    updatedAt: new Date(user.updatedAt),
+  };
+}
+
+async function readState(): Promise<AppState> {
+  await ensureDatabase();
+  const raw = await readFile(STATE_FILE, "utf8");
+  return JSON.parse(raw) as AppState;
+}
+
+async function writeState(state: AppState) {
+  await writeFile(STATE_FILE, JSON.stringify(state, null, 2));
+}
+
+async function mutateState<T>(mutator: (state: AppState) => Promise<T> | T): Promise<T> {
+  const run = async () => {
+    const state = await readState();
+    const nextState = cloneState(state);
+    const result = await mutator(nextState);
+    await writeState(nextState);
+    return result;
+  };
+
+  const resultPromise = writeQueue.then(run);
+  writeQueue = resultPromise.then(() => undefined, () => undefined);
+  return resultPromise;
+}
+
+export async function ensureDatabase() {
+  await mkdir(dirname(STATE_FILE), { recursive: true });
+  try {
+    await readFile(STATE_FILE, "utf8");
+  } catch {
+    await writeState(EMPTY_STATE);
+  }
+}
+
+export async function getDb() {
+  return readState();
+}
+
+export async function createUser(input: { name: string; email: string; password: string }) {
+  const normalizedEmail = input.email.trim().toLowerCase();
+  return mutateState((state) => {
+    if (state.users.some((user) => user.email === normalizedEmail)) {
+      throw new Error("Email already exists");
+    }
+
+    const now = new Date().toISOString();
+    const user: StoredUser = {
+      id: randomUUID(),
+      name: input.name.trim(),
+      email: normalizedEmail,
+      passwordHash: hashPassword(input.password),
+      emailVerified: true,
+      image: null,
+      createdAt: now,
+      updatedAt: now,
+    };
+    state.users.push(user);
+    return publicUser(user);
+  });
+}
+
+export async function findUserByEmail(email: string) {
+  const normalizedEmail = email.trim().toLowerCase();
+  const state = await readState();
+  const user = state.users.find((entry) => entry.email === normalizedEmail);
+  return user ? publicUser(user) : null;
+}
+
+export async function validateUserCredentials(email: string, password: string) {
+  const normalizedEmail = email.trim().toLowerCase();
+  const state = await readState();
+  const user = state.users.find((entry) => entry.email === normalizedEmail);
+  if (!user || !verifyPassword(password, user.passwordHash)) {
+    return null;
+  }
+  return publicUser(user);
+}
+
+export async function createSession(input: { userId: string; ipAddress?: string | null; userAgent?: string | null }) {
+  return mutateState((state) => {
+    const now = new Date();
+    const session: StoredSession = {
+      id: randomUUID(),
+      token: randomBytes(24).toString("hex"),
+      userId: input.userId,
+      expiresAt: new Date(now.getTime() + 1000 * 60 * 60 * 24 * 14).toISOString(),
+      createdAt: now.toISOString(),
+      updatedAt: now.toISOString(),
+      ipAddress: input.ipAddress ?? null,
+      userAgent: input.userAgent ?? null,
+    };
+    state.sessions.push(session);
+    return session.token;
+  });
+}
+
+export async function getUserBySessionToken(token: string) {
+  const now = new Date();
+  const state = await readState();
+  const session = state.sessions.find((entry) => entry.token === token && new Date(entry.expiresAt) > now);
+  if (!session) {
+    return null;
+  }
+  const user = state.users.find((entry) => entry.id === session.userId);
+  return user ? publicUser(user) : null;
+}
+
+export async function deleteSession(token: string) {
+  return mutateState((state) => {
+    state.sessions = state.sessions.filter((entry) => entry.token !== token);
+  });
+}
+
 export async function listBoardsForUser(userId: string): Promise<BoardSummary[]> {
-  const db = await getDb();
-  const owned = await db
-    .select({
-      id: boards.id,
-      name: boards.name,
-      ownerId: boards.ownerId,
-      updatedAt: boards.updatedAt,
-      createdAt: boards.createdAt,
-      role: sql<BoardRole>`'owner'`,
-    })
-    .from(boards)
-    .where(eq(boards.ownerId, userId));
+  const state = await readState();
+  const owned = state.boards
+    .filter((board) => board.ownerId === userId)
+    .map((board) => ({
+      id: board.id,
+      name: board.name,
+      ownerId: board.ownerId,
+      createdAt: toDate(board.createdAt),
+      updatedAt: toDate(board.updatedAt),
+      role: "owner" as const,
+    }));
 
-  const shared = await db
-    .select({
-      id: boards.id,
-      name: boards.name,
-      ownerId: boards.ownerId,
-      updatedAt: boards.updatedAt,
-      createdAt: boards.createdAt,
-      role: boardMembers.role,
+  const shared = state.boardMembers
+    .filter((member) => member.userId === userId)
+    .map((member) => {
+      const board = state.boards.find((entry) => entry.id === member.boardId);
+      if (!board) {
+        return null;
+      }
+      return {
+        id: board.id,
+        name: board.name,
+        ownerId: board.ownerId,
+        createdAt: toDate(board.createdAt),
+        updatedAt: toDate(board.updatedAt),
+        role: member.role,
+      };
     })
-    .from(boardMembers)
-    .innerJoin(boards, eq(boardMembers.boardId, boards.id))
-    .where(eq(boardMembers.userId, userId));
+    .filter(Boolean) as BoardSummary[];
 
-  return [...owned, ...shared].sort((a, b) => b.updatedAt.getTime() - a.updatedAt.getTime());
+  return [...owned, ...shared].sort((left, right) => right.updatedAt.getTime() - left.updatedAt.getTime());
 }
 
 export async function createBoard(input: { ownerId: string; name?: string }) {
-  const db = await getDb();
-  const now = new Date();
-  const boardId = randomUUID();
-  await db.insert(boards).values({
-    id: boardId,
-    name: input.name?.trim() || "Untitled board",
-    ownerId: input.ownerId,
-    createdAt: now,
-    updatedAt: now,
-    latestSnapshot: null,
+  return mutateState((state) => {
+    const now = new Date().toISOString();
+    const boardId = randomUUID();
+    state.boards.push({
+      id: boardId,
+      name: input.name?.trim() || "Untitled board",
+      ownerId: input.ownerId,
+      createdAt: now,
+      updatedAt: now,
+      latestSnapshot: null,
+    });
+    return boardId;
   });
-  return boardId;
 }
 
 export async function renameBoard(input: { boardId: string; ownerId: string; name: string }) {
-  const db = await getDb();
-  await db
-    .update(boards)
-    .set({ name: input.name.trim() || "Untitled board", updatedAt: new Date() })
-    .where(and(eq(boards.id, input.boardId), eq(boards.ownerId, input.ownerId)));
+  return mutateState((state) => {
+    const board = state.boards.find((entry) => entry.id === input.boardId && entry.ownerId === input.ownerId);
+    if (board) {
+      board.name = input.name.trim() || "Untitled board";
+      board.updatedAt = new Date().toISOString();
+    }
+  });
 }
 
 export async function deleteBoard(input: { boardId: string; ownerId: string }) {
-  const db = await getDb();
-  await db.delete(boards).where(and(eq(boards.id, input.boardId), eq(boards.ownerId, input.ownerId)));
+  return mutateState((state) => {
+    state.boards = state.boards.filter((entry) => !(entry.id === input.boardId && entry.ownerId === input.ownerId));
+    state.boardMembers = state.boardMembers.filter((entry) => entry.boardId !== input.boardId);
+    state.shareLinks = state.shareLinks.filter((entry) => entry.boardId !== input.boardId);
+  });
 }
 
 export async function getBoardById(boardId: string) {
-  const db = await getDb();
-  const [board] = await db.select().from(boards).where(eq(boards.id, boardId)).limit(1);
-  return board ?? null;
+  const state = await readState();
+  const board = state.boards.find((entry) => entry.id === boardId);
+  if (!board) {
+    return null;
+  }
+
+  return {
+    id: board.id,
+    name: board.name,
+    ownerId: board.ownerId,
+    createdAt: toDate(board.createdAt),
+    updatedAt: toDate(board.updatedAt),
+    latestSnapshot: board.latestSnapshot,
+  };
 }
 
 export async function resolveBoardAccess(input: { boardId: string; userId: string | null; shareToken?: string | null }): Promise<{ board: Awaited<ReturnType<typeof getBoardById>>; access: BoardAccessContext | null }> {
-  const db = await getDb();
-  const board = await getBoardById(input.boardId);
+  const state = await readState();
+  const board = state.boards.find((entry) => entry.id === input.boardId);
   if (!board) {
     return { board: null, access: null };
   }
 
-  const [member] = input.userId
-    ? await db
-        .select({ role: boardMembers.role })
-        .from(boardMembers)
-        .where(and(eq(boardMembers.boardId, input.boardId), eq(boardMembers.userId, input.userId)))
-        .limit(1)
-    : [];
+  const member = input.userId ? state.boardMembers.find((entry) => entry.boardId === input.boardId && entry.userId === input.userId) : null;
+  const shareToken = input.shareToken ?? null;
+  const shareLink = shareToken
+    ? state.shareLinks.find((entry) => entry.boardId === input.boardId && entry.tokenHash === hashShareToken(shareToken) && !entry.revokedAt)
+    : null;
 
-  const [shareLink] = input.shareToken
-    ? await db
-        .select({ id: shareLinks.id, mode: shareLinks.mode })
-        .from(shareLinks)
-        .where(and(eq(shareLinks.boardId, input.boardId), eq(shareLinks.tokenHash, hashShareToken(input.shareToken)), isNull(shareLinks.revokedAt)))
-        .limit(1)
-    : [];
+  const hydratedBoard = {
+    id: board.id,
+    name: board.name,
+    ownerId: board.ownerId,
+    createdAt: toDate(board.createdAt),
+    updatedAt: toDate(board.updatedAt),
+    latestSnapshot: board.latestSnapshot,
+  };
 
   return {
-    board,
+    board: hydratedBoard,
     access: buildBoardAccessContext({
       boardId: board.id,
       ownerId: board.ownerId,
@@ -216,138 +342,153 @@ export async function resolveBoardAccess(input: { boardId: string; userId: strin
 }
 
 export async function listBoardMembers(boardId: string): Promise<BoardMemberSummary[]> {
-  const db = await getDb();
-  const rows = await db
-    .select({
-      userId: user.id,
-      email: user.email,
-      name: user.name,
-      role: boardMembers.role,
+  const state = await readState();
+  return state.boardMembers
+    .filter((member) => member.boardId === boardId)
+    .map((member) => {
+      const foundUser = state.users.find((entry) => entry.id === member.userId);
+      if (!foundUser) {
+        return null;
+      }
+      return {
+        userId: foundUser.id,
+        email: foundUser.email,
+        name: foundUser.name,
+        role: member.role,
+      };
     })
-    .from(boardMembers)
-    .innerJoin(user, eq(boardMembers.userId, user.id))
-    .where(eq(boardMembers.boardId, boardId));
-
-  return rows;
+    .filter(Boolean) as BoardMemberSummary[];
 }
 
 export async function addBoardMemberByEmail(input: { boardId: string; ownerId: string; email: string; role: "editor" | "viewer" }) {
-  const db = await getDb();
-  const [board] = await db.select().from(boards).where(and(eq(boards.id, input.boardId), eq(boards.ownerId, input.ownerId))).limit(1);
-  if (!board) {
-    throw new Error("Board not found or owner mismatch");
-  }
+  return mutateState((state) => {
+    const board = state.boards.find((entry) => entry.id === input.boardId && entry.ownerId === input.ownerId);
+    if (!board) {
+      throw new Error("Board not found or owner mismatch");
+    }
 
-  const [targetUser] = await db.select().from(user).where(eq(user.email, input.email.trim().toLowerCase())).limit(1);
-  if (!targetUser) {
-    throw new Error("User not found. Invite existing users only in MVP.");
-  }
+    const targetUser = state.users.find((entry) => entry.email === input.email.trim().toLowerCase());
+    if (!targetUser) {
+      throw new Error("User not found. Invite existing users only in MVP.");
+    }
 
-  if (targetUser.id === board.ownerId) {
-    return;
-  }
+    if (targetUser.id === board.ownerId) {
+      return;
+    }
 
-  const now = new Date();
-  await db
-    .insert(boardMembers)
-    .values({
+    const now = new Date().toISOString();
+    const existing = state.boardMembers.find((entry) => entry.boardId === input.boardId && entry.userId === targetUser.id);
+    if (existing) {
+      existing.role = input.role;
+      existing.updatedAt = now;
+      return;
+    }
+
+    state.boardMembers.push({
       boardId: input.boardId,
       userId: targetUser.id,
       role: input.role,
       createdAt: now,
       updatedAt: now,
-    })
-    .onConflictDoUpdate({
-      target: [boardMembers.boardId, boardMembers.userId],
-      set: { role: input.role, updatedAt: now },
     });
+  });
 }
 
 export async function updateBoardMemberRole(input: { boardId: string; ownerId: string; userId: string; role: "editor" | "viewer" }) {
-  const db = await getDb();
-  const [board] = await db.select().from(boards).where(and(eq(boards.id, input.boardId), eq(boards.ownerId, input.ownerId))).limit(1);
-  if (!board) {
-    throw new Error("Board not found or owner mismatch");
-  }
+  return mutateState((state) => {
+    const board = state.boards.find((entry) => entry.id === input.boardId && entry.ownerId === input.ownerId);
+    if (!board) {
+      throw new Error("Board not found or owner mismatch");
+    }
 
-  await db
-    .update(boardMembers)
-    .set({ role: input.role, updatedAt: new Date() })
-    .where(and(eq(boardMembers.boardId, input.boardId), eq(boardMembers.userId, input.userId)));
+    const member = state.boardMembers.find((entry) => entry.boardId === input.boardId && entry.userId === input.userId);
+    if (member) {
+      member.role = input.role;
+      member.updatedAt = new Date().toISOString();
+    }
+  });
 }
 
 export async function removeBoardMember(input: { boardId: string; ownerId: string; userId: string }) {
-  const db = await getDb();
-  const [board] = await db.select().from(boards).where(and(eq(boards.id, input.boardId), eq(boards.ownerId, input.ownerId))).limit(1);
-  if (!board) {
-    throw new Error("Board not found or owner mismatch");
-  }
-
-  await db.delete(boardMembers).where(and(eq(boardMembers.boardId, input.boardId), eq(boardMembers.userId, input.userId)));
+  return mutateState((state) => {
+    const board = state.boards.find((entry) => entry.id === input.boardId && entry.ownerId === input.ownerId);
+    if (!board) {
+      throw new Error("Board not found or owner mismatch");
+    }
+    state.boardMembers = state.boardMembers.filter((entry) => !(entry.boardId === input.boardId && entry.userId === input.userId));
+  });
 }
 
 export async function createShareLink(input: { boardId: string; ownerId: string; mode: ShareLinkMode }) {
-  const db = await getDb();
-  const [board] = await db.select().from(boards).where(and(eq(boards.id, input.boardId), eq(boards.ownerId, input.ownerId))).limit(1);
-  if (!board) {
-    throw new Error("Board not found or owner mismatch");
-  }
+  return mutateState((state) => {
+    const board = state.boards.find((entry) => entry.id === input.boardId && entry.ownerId === input.ownerId);
+    if (!board) {
+      throw new Error("Board not found or owner mismatch");
+    }
 
-  const rawToken = randomUUID().replace(/-/g, "");
-  const id = randomUUID();
-  await db.insert(shareLinks).values({
-    id,
-    boardId: input.boardId,
-    tokenHash: hashShareToken(rawToken),
-    mode: input.mode,
-    createdByUserId: input.ownerId,
-    createdAt: new Date(),
-    revokedAt: null,
+    const rawToken = randomUUID().replace(/-/g, "");
+    const id = randomUUID();
+    state.shareLinks.push({
+      id,
+      boardId: input.boardId,
+      tokenHash: hashShareToken(rawToken),
+      mode: input.mode,
+      createdByUserId: input.ownerId,
+      createdAt: new Date().toISOString(),
+      revokedAt: null,
+    });
+
+    const baseUrl = process.env.APP_URL ?? "http://localhost:3000";
+    return {
+      id,
+      token: rawToken,
+      url: `${baseUrl}/b/${input.boardId}?share=${rawToken}`,
+    };
   });
-
-  const baseUrl = process.env.APP_URL ?? "http://localhost:3000";
-  return {
-    id,
-    token: rawToken,
-    url: `${baseUrl}/b/${input.boardId}?share=${rawToken}`,
-  };
 }
 
 export async function listShareLinks(boardId: string): Promise<Array<Omit<ShareLinkSummary, "url"> & { tokenHash?: never }>> {
-  const db = await getDb();
-  return db.select({ id: shareLinks.id, mode: shareLinks.mode, createdAt: shareLinks.createdAt, revokedAt: shareLinks.revokedAt }).from(shareLinks).where(eq(shareLinks.boardId, boardId)).orderBy(desc(shareLinks.createdAt));
+  const state = await readState();
+  return state.shareLinks
+    .filter((entry) => entry.boardId === boardId)
+    .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+    .map((entry) => ({
+      id: entry.id,
+      mode: entry.mode,
+      createdAt: toDate(entry.createdAt),
+      revokedAt: entry.revokedAt ? toDate(entry.revokedAt) : null,
+    }));
 }
 
 export async function revokeShareLink(input: { boardId: string; ownerId: string; linkId: string }) {
-  const db = await getDb();
-  const [board] = await db.select().from(boards).where(and(eq(boards.id, input.boardId), eq(boards.ownerId, input.ownerId))).limit(1);
-  if (!board) {
-    throw new Error("Board not found or owner mismatch");
-  }
-
-  await db
-    .update(shareLinks)
-    .set({ revokedAt: new Date() })
-    .where(and(eq(shareLinks.id, input.linkId), eq(shareLinks.boardId, input.boardId), isNull(shareLinks.revokedAt)));
+  return mutateState((state) => {
+    const board = state.boards.find((entry) => entry.id === input.boardId && entry.ownerId === input.ownerId);
+    if (!board) {
+      throw new Error("Board not found or owner mismatch");
+    }
+    const link = state.shareLinks.find((entry) => entry.id === input.linkId && entry.boardId === input.boardId && !entry.revokedAt);
+    if (link) {
+      link.revokedAt = new Date().toISOString();
+    }
+  });
 }
 
 export async function getUsersByIds(userIds: string[]) {
-  if (userIds.length === 0) {
-    return [];
-  }
-  const db = await getDb();
-  return db.select().from(user).where(inArray(user.id, userIds));
+  const state = await readState();
+  return state.users.filter((entry) => userIds.includes(entry.id)).map(publicUser);
 }
 
 export async function saveBoardSnapshot(boardId: string, snapshot: unknown) {
-  const db = await getDb();
-  await db.update(boards).set({ latestSnapshot: snapshot as any, updatedAt: new Date() }).where(eq(boards.id, boardId));
+  return mutateState((state) => {
+    const board = state.boards.find((entry) => entry.id === boardId);
+    if (board) {
+      board.latestSnapshot = snapshot;
+      board.updatedAt = new Date().toISOString();
+    }
+  });
 }
 
 export async function getBoardSnapshot(boardId: string) {
-  const db = await getDb();
-  const [result] = await db.select({ latestSnapshot: boards.latestSnapshot }).from(boards).where(eq(boards.id, boardId)).limit(1);
-  return result?.latestSnapshot ?? null;
+  const state = await readState();
+  return state.boards.find((entry) => entry.id === boardId)?.latestSnapshot ?? null;
 }
-
-export { schema, user, session, account, verification, boards, boardMembers, shareLinks } from "./schema";

@@ -1,11 +1,10 @@
 import { redirect } from "next/navigation";
 import { headers } from "next/headers";
-import { getAuth } from "@whiteboard/auth";
+import { getSessionFromHeaders } from "@whiteboard/auth";
 
 export async function getServerSession() {
   const requestHeaders = await headers();
-  const auth = await getAuth();
-  return auth.api.getSession({ headers: requestHeaders as any });
+  return getSessionFromHeaders(requestHeaders);
 }
 
 export async function requireSession() {
