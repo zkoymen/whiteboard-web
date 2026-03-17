@@ -5,6 +5,13 @@ The main drawing functionalities were taken from tldraw library, no need to rein
 
 Deployment options are being considered for now...
 
+<img width="70%" alt="image" src="https://github.com/user-attachments/assets/391287de-6761-4593-aef0-9e72b346431e" />
+
+----------after sign-up and the creation of the whiteboard----------------------
+
+<img width="50%" alt="127 0 0 1_3000_b_0674ec14-8a19-4cbd-b13b-9337325ed5af (1)" src="https://github.com/user-attachments/assets/79abeda3-6ca0-4fe5-aea0-38622bb77c95" />
+
+
 ## Features
 
 - Email/password auth
@@ -32,6 +39,7 @@ Then open:
 
 - Web: `http://localhost:3000`
 - Realtime: `http://localhost:4001`
+
 
 ## Scripts
 
