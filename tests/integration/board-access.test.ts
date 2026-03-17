@@ -1,69 +1,49 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import { account, addBoardMemberByEmail, boardMembers, boards, createBoard, createShareLink, ensureDatabase, getDb, resolveBoardAccess, session, shareLinks, user, verification } from "@whiteboard/db";
+import { addBoardMemberByEmail, createBoard, createShareLink, createUser, ensureDatabase, resolveBoardAccess } from "@whiteboard/db";
+import { rm } from "node:fs/promises";
+import { resolve } from "node:path";
 
-async function resetDatabase() {
-  const db = await getDb();
-  await db.delete(boardMembers);
-  await db.delete(shareLinks);
-  await db.delete(boards);
-  await db.delete(account);
-  await db.delete(session);
-  await db.delete(verification);
-  await db.delete(user);
-}
-
-async function seedUsers() {
-  const db = await getDb();
-  const now = new Date();
-  await db.insert(user).values([
-    {
-      id: "owner-1",
-      name: "Owner User",
-      email: "owner@example.com",
-      emailVerified: true,
-      image: null,
-      createdAt: now,
-      updatedAt: now,
-    },
-    {
-      id: "editor-1",
-      name: "Editor User",
-      email: "editor@example.com",
-      emailVerified: true,
-      image: null,
-      createdAt: now,
-      updatedAt: now,
-    },
-  ]);
-}
+const STATE_FILE = resolve(process.env.INIT_CWD ?? process.cwd(), "data", "app-state.json");
 
 describe("board access integration", () => {
   beforeEach(async () => {
     process.env.APP_URL = "http://localhost:3000";
+    await rm(STATE_FILE, { force: true });
     await ensureDatabase();
-    await resetDatabase();
-    await seedUsers();
+    await createUser({
+      name: "Owner User",
+      email: "owner@example.com",
+      password: "password123",
+    });
+    await createUser({
+      name: "Editor User",
+      email: "editor@example.com",
+      password: "password123",
+    });
   });
 
   it("resolves member access", async () => {
-    const boardId = await createBoard({ ownerId: "owner-1", name: "Sprint board" });
+    const owner = await resolveUserId("owner@example.com");
+    const editor = await resolveUserId("editor@example.com");
+    const boardId = await createBoard({ ownerId: owner, name: "Sprint board" });
     await addBoardMemberByEmail({
       boardId,
-      ownerId: "owner-1",
+      ownerId: owner,
       email: "editor@example.com",
       role: "editor",
     });
 
-    const { access } = await resolveBoardAccess({ boardId, userId: "editor-1" });
+    const { access } = await resolveBoardAccess({ boardId, userId: editor });
     expect(access?.role).toBe("editor");
     expect(access?.canEdit).toBe(true);
   });
 
   it("resolves share link access", async () => {
-    const boardId = await createBoard({ ownerId: "owner-1", name: "Share board" });
+    const owner = await resolveUserId("owner@example.com");
+    const boardId = await createBoard({ ownerId: owner, name: "Share board" });
     const shareLink = await createShareLink({
       boardId,
-      ownerId: "owner-1",
+      ownerId: owner,
       mode: "view",
     });
 
@@ -72,3 +52,12 @@ describe("board access integration", () => {
     expect(access?.shareMode).toBe("view");
   });
 });
+
+async function resolveUserId(email: string) {
+  const { findUserByEmail } = await import("@whiteboard/db");
+  const user = await findUserByEmail(email);
+  if (!user) {
+    throw new Error(`Missing user for ${email}`);
+  }
+  return user.id;
+}

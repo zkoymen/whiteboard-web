@@ -17,9 +17,9 @@ const rooms = new Map<string, Promise<TLSocketRoom<any, SessionMeta>>>();
 const saveTimers = new Map<string, NodeJS.Timeout>();
 
 async function createRoom(boardId: string) {
-  const initialSnapshot = await getBoardSnapshot(boardId);
+  const initialSnapshot = (await getBoardSnapshot(boardId)) as Record<string, unknown> | null;
   const room = new TLSocketRoom<any, SessionMeta>({
-    initialSnapshot: initialSnapshot ?? undefined,
+    initialSnapshot: initialSnapshot as any,
     onDataChange() {
       const existingTimer = saveTimers.get(boardId);
       if (existingTimer) {
