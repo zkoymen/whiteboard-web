@@ -1,0 +1,17 @@
+{
+  "name": "@whiteboard/auth",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "build": "tsc --project tsconfig.json",
+    "typecheck": "tsc --project tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@whiteboard/db": "0.1.0",
+    "better-auth": "^1.5.5"
+  }
+}
