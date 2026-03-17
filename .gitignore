@@ -12,3 +12,5 @@ test-results
 apps/web/.next
 apps/web/tldraw
 data
+
+*.tsbuildinfo
